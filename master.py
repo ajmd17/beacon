@@ -31,7 +31,7 @@ class Ticket:
 
         self.start_time = datetime.now()
 
-        self.status = 'pending' # pending, assigned, done, failed
+        self.status = 'pending' # pending, assigned, done, cancelled, failed
 
         self.assigned_worker_id = None
         self.result = None
@@ -40,10 +40,14 @@ class Ticket:
     def timed_out(self):
         return (datetime.now() - self.start_time).total_seconds() > 60
 
+    @property
+    def cancelled(self):
+        return self.status == 'cancelled'
+
     async def wait_for_result(self):
         start_timestamp = datetime.now()
 
-        while not self.status in ['done', 'failed']:
+        while not self.status in ['done', 'failed', 'cancelled']:
             # timeout after 30 seconds
             print("seconds: {}".format((datetime.now() - start_timestamp).total_seconds()))
             if (datetime.now() - start_timestamp).total_seconds() > 30:
@@ -52,7 +56,7 @@ class Ticket:
                 break
 
             try:
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.05)
             except Exception as e:
                 print("Error waiting for ticket result: {}".format(e))
 
@@ -95,6 +99,10 @@ class Master:
                             # Add ticket to list of tickets to remove
                             print("Ticket {} timed out after 60 seconds".format(ticket.id))
 
+                            tickets_to_remove.append(ticket)
+
+                            continue
+                        elif ticket.cancelled:
                             tickets_to_remove.append(ticket)
 
                             continue
@@ -145,11 +153,21 @@ class Master:
 
         return ticket
     
-    def remove_ticket(self, ticket: Ticket | str):
-        if type(ticket) is str:
-            self.ticket_queue = [t for t in self.ticket_queue if t.id != ticket]
-        else:
-            self.ticket_queue.remove(ticket)
+    async def remove_ticket(self, ticket: Ticket | str, status: str = 'cancelled'):
+        ticket_object: Ticket = ticket if type(ticket) is Ticket else next(t for t in self.ticket_queue if t.id == ticket)
+
+        if ticket_object is None:
+            return
+        
+        try:
+            await self.unassign_ticket(ticket_object)
+        except StopIteration:
+            pass
+        
+        if status is not None:
+            ticket_object.status = status
+
+        self.ticket_queue.remove(ticket_object)
 
     async def assign_ticket(self, ticket: Ticket, client: Client | str):
         client_object = client if type(client) is Client else next(c for c in self.clients if c.id == client)
@@ -166,6 +184,28 @@ class Master:
         })
 
         print("sending message: {}".format(message))
+
+        await client_object.websocket.send_text(message)
+
+    async def unassign_ticket(self, ticket: Ticket | str):
+        ticket_object = ticket if type(ticket) is Ticket else next(t for t in self.ticket_queue if t.id == ticket)
+
+        if ticket_object is None:
+            return
+        
+        client_object = next(c for c in self.clients if c.id == ticket_object.assigned_worker_id)
+        
+        ticket_object.assigned_worker_id = None
+        ticket_object.status = 'pending'
+
+        # if the client is still connected, send the message to unassign the ticket
+        if client_object is None:
+            return
+
+        message = json.dumps({
+            'type': 'UnassignTicket',
+            'ticket': ticket_object.id
+        })
 
         await client_object.websocket.send_text(message)
 
@@ -250,13 +290,26 @@ async def shutdown_app():
     master.stop_ticket_assignment_thread()
 
 @app.post("/")
-async def provide_completions_endpoint(input: dict[str, str], postback_url: str = None, meta: dict = {}, priority: int = 0):
+async def provide_completions_endpoint(input: dict[str, Any], postback_url: str = None, meta: dict = {}, priority: int = 0):
     global master
 
-    ticket_data = {
-    }
+    ticket_data = input
 
     ticket = Ticket('ProvideCompletions', ticket_data, postback_url, meta, priority)
+
+    print("meta = {}".format(meta))
+
+    if meta and "request_id" in meta:
+        # remove all tickets with the same request_id
+        for t in master.ticket_queue[:]:
+            if t.meta and "request_id" in t.meta and t.meta["request_id"] == meta["request_id"]:
+                print("Replace ticket with request_id {}".format(meta["request_id"]))
+
+                try:
+                    await master.remove_ticket(t, status='cancelled')
+                except Exception as e:
+                    print("Error removing ticket: {}".format(e))
+
     master.add_ticket(ticket)
 
     # if no postback_url was provided, asynchoronously wait until the ticket has a result.
@@ -265,18 +318,19 @@ async def provide_completions_endpoint(input: dict[str, str], postback_url: str 
         await ticket.wait_for_result()
         print("After waiting for result {}".format(ticket.result))
 
-        if ticket.result:
-            return {
-                'results': ticket.result,
-                'meta': ticket.meta if ticket.meta else { }
-            }
-        else:
+        if ticket.result is None:
             # Send timeout status code
             return {
                 'status': 408,
                 'message': 'Ticket timed out after 30 seconds',
                 'results': []
             }
+
+        return {
+            'id': ticket.id,
+            'results': ticket.result,
+            'meta': ticket.meta if ticket.meta else { }
+        }
 
     return ticket.to_dict()
 
